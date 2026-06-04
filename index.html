@@ -1,15 +1,17 @@
 <!DOCTYPE html>
-<html lang="es">
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <link rel="shortcut icon" href="img/icon.png" type="image/x-icon">
+    <link rel="shortcut icon" href="img/icon.png" type="image/png">
+    <link rel="apple-touch-icon" href="img/icon.png">
     <link rel="stylesheet" href="style.css" />
     <title>EnviroVoice</title>
   </head>
   <body>
     <div class="container">
       <div class="header">
+        <img src="img/icon.png" alt="EnviroVoice Icon" class="app-icon" />
         <img src="img/title-light.png" alt="EnviroVoice" class="title-img title-light" />
         <img src="img/title-dark.png" alt="EnviroVoice" class="title-img title-dark" />
       </div>
@@ -59,7 +61,7 @@
 
       <!-- Screen 3: Call Controls -->
       <div id="callControls" class="call-controls" style="display: none">
-        <!-- Selector de Micrófono -->
+        <!-- Mic Selector -->
         <div class="mic-selector-container">
           <label for="micSelector">🎤 Select Microphone:</label>
           <select id="micSelector" class="mic-selector">
@@ -71,7 +73,7 @@
           <button id="exitBtn" class="control-btn exit">📞 Disconnect</button>
         </div>
 
-        <!-- Push to Talk (solo PC) -->
+        <!-- Push to Talk (Desktop only) -->
         <div id="pttContainer" class="ptt-container" style="display: none;">
           <div class="ptt-header">
             <label class="ptt-label">
@@ -97,7 +99,7 @@
       </div>
     </div>
 
-    <!-- Botón de modo -->
+    <!-- Dark mode toggle -->
     <button id="darkModeToggle"></button>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.49/Tone.js"></script>
     <script src="script.js"></script>

@@ -1799,6 +1799,55 @@ class UIManager {
 }
 
 // =====================================================
+// CLASS: BackgroundKeepalive
+// Plays a silent audio buffer on loop so the browser
+// treats the page as active audio — prevents JS timer
+// throttling and WebSocket drops when backgrounded.
+// =====================================================
+class BackgroundKeepalive {
+  constructor() {
+    this.source = null;
+    this.gainNode = null;
+    this.active = false;
+  }
+
+  enable() {
+    if (this.active) return;
+    try {
+      const ctx = Tone.context.rawContext || Tone.context._context;
+      const buf = ctx.createBuffer(1, 1, 22050);
+      this.gainNode = ctx.createGain();
+      this.gainNode.gain.value = 0.001; // inaudible
+      this.gainNode.connect(ctx.destination);
+
+      const loop = () => {
+        if (!this.active) return;
+        this.source = ctx.createBufferSource();
+        this.source.buffer = buf;
+        this.source.connect(this.gainNode);
+        this.source.onended = loop;
+        this.source.start(0);
+      };
+      this.active = true;
+      loop();
+      console.log("✓ Background keepalive ON");
+    } catch (e) {
+      console.warn("⚠️ Keepalive unavailable:", e.message);
+    }
+  }
+
+  disable() {
+    if (!this.active) return;
+    this.active = false;
+    try { this.source?.stop(); } catch (_) {}
+    try { this.gainNode?.disconnect(); } catch (_) {}
+    this.source = null;
+    this.gainNode = null;
+    console.log("✓ Background keepalive OFF");
+  }
+}
+
+// =====================================================
 // CLASE PRINCIPAL: VoiceChatApp
 // Coordina todos los componentes
 // =====================================================
@@ -1863,6 +1912,13 @@ class VoiceChatApp {
     this.ws = null;
     this.currentGamertag = "";
     this.heartbeatInterval = null;
+
+    // Background & reconnect state
+    this.isInCall = false;
+    this.currentRoomUrl = null;
+    this._reconnectAttempts = 0;
+    this._reconnectTimeout = null;
+    this.keepalive = new BackgroundKeepalive();
   }
 
   async init() {
@@ -1889,6 +1945,22 @@ class VoiceChatApp {
     } else {
       this.ui.showScreen("setup");
     }
+
+    // Re-connect / resume when user returns to the tab / app
+    document.addEventListener("visibilitychange", async () => {
+      if (document.visibilityState !== "visible" || !this.isInCall) return;
+
+      // Resume AudioContext if browser suspended it
+      if (Tone.context.state === "suspended") {
+        await Tone.start().catch(() => {});
+      }
+
+      // If WebSocket dropped while backgrounded, reconnect now
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        clearTimeout(this._reconnectTimeout);
+        await this._reconnectWs();
+      }
+    });
 
     console.log("✓ EnviroVoice initialized");
   }
@@ -2189,13 +2261,19 @@ class VoiceChatApp {
       this.webrtc.setGamertag(this.currentGamertag);
       this.minecraft.setGamertag(this.currentGamertag);
 
+      // Track call state for reconnect logic
+      this.currentRoomUrl = url;
+      this.isInCall = true;
+      this._reconnectAttempts = 0;
+      this.keepalive.enable();
+
       this.ws = new WebSocket(url.replace("http", "ws"));
       this.webrtc.setWebSocket(this.ws);
 
       this.ws.onopen = () => this.onWebSocketOpen();
       this.ws.onmessage = (msg) => this.onWebSocketMessage(msg);
       this.ws.onerror = () => this.onWebSocketError();
-      this.ws.onclose = () => this.exitCall();
+      this.ws.onclose = () => this._onWsClose();
     } catch (e) {
       console.error("Connection error:", e);
       alert("Error connecting to server: " + e.message);
@@ -2205,6 +2283,9 @@ class VoiceChatApp {
 
   async onWebSocketOpen() {
     this.ui.updateRoomInfo("✅ Connected to voice chat");
+
+    // Reset reconnect counter on successful open
+    this._reconnectAttempts = 0;
 
     this.ws.send(
       JSON.stringify({ type: "join", gamertag: this.currentGamertag })
@@ -2229,13 +2310,15 @@ class VoiceChatApp {
       `📡 Initial PTT state sent: ${isTalking ? "TALKING" : "MUTED"}`
     );
 
+    // Restart heartbeat (clear stale one first — happens on reconnects)
+    clearInterval(this.heartbeatInterval);
     this.heartbeatInterval = setInterval(() => {
       if (this.ws && this.ws.readyState === 1) {
         this.ws.send(
           JSON.stringify({ type: "heartbeat", gamertag: this.currentGamertag })
         );
       }
-    }, 15000);
+    }, 10000); // 10 s — tighter than before to outlast server timeouts
   }
 
   _setupMicSelector() {
@@ -2285,6 +2368,66 @@ class VoiceChatApp {
     this.micChangeHandler = micChangeHandler;
     this.ui.elements.micSelector.addEventListener("change", this.micChangeHandler);
   }
+
+  // ─── Background / reconnect helpers ──────────────────────────────────────
+
+  _onWsClose() {
+    clearInterval(this.heartbeatInterval);
+    this.heartbeatInterval = null;
+
+    if (!this.isInCall) return; // user clicked Exit — nothing to do
+
+    console.warn("⚠️ WebSocket closed unexpectedly — scheduling reconnect");
+    this.ui.updateRoomInfo("⚠️ Connection lost — reconnecting…");
+    this._scheduleReconnect();
+  }
+
+  _scheduleReconnect() {
+    if (this._reconnectAttempts >= 10) {
+      console.error("❌ Max reconnect attempts reached — exiting call");
+      this.exitCall();
+      return;
+    }
+
+    // Linear backoff: 1 s, 2 s, 3 s … max 10 s
+    const delay = Math.min(1000 * (this._reconnectAttempts + 1), 10000);
+    this._reconnectAttempts++;
+    console.log(
+      `🔄 Reconnect attempt ${this._reconnectAttempts}/10 in ${delay / 1000}s`
+    );
+    this.ui.updateRoomInfo(
+      `⏳ Reconnecting… (${this._reconnectAttempts}/10)`
+    );
+    this._reconnectTimeout = setTimeout(() => this._reconnectWs(), delay);
+  }
+
+  async _reconnectWs() {
+    if (!this.isInCall || !this.currentRoomUrl) return;
+
+    try {
+      // Close stale socket cleanly
+      if (this.ws) {
+        this.ws.onclose = null; // detach handler so close() doesn't re-trigger
+        try { this.ws.close(); } catch (_) {}
+        this.ws = null;
+      }
+
+      this.ws = new WebSocket(
+        this.currentRoomUrl.replace(/^http/, "ws")
+      );
+      this.webrtc.setWebSocket(this.ws);
+
+      this.ws.onopen = () => this.onWebSocketOpen();
+      this.ws.onmessage = (msg) => this.onWebSocketMessage(msg);
+      this.ws.onerror = () => this.onWebSocketError();
+      this.ws.onclose = () => this._onWsClose();
+    } catch (e) {
+      console.error("❌ Reconnect failed:", e);
+      this._scheduleReconnect();
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
 
   async onWebSocketMessage(msg) {
     const data = JSON.parse(msg.data);
@@ -2461,6 +2604,12 @@ class VoiceChatApp {
   }
 
   exitCall() {
+    // Mark call ended first — prevents _onWsClose from triggering reconnect
+    this.isInCall = false;
+    clearTimeout(this._reconnectTimeout);
+    this._reconnectAttempts = 0;
+    this.keepalive.disable();
+
     if (this.ws && this.ws.readyState === 1) {
       this.ws.send(
         JSON.stringify({ type: "leave", gamertag: this.currentGamertag })
